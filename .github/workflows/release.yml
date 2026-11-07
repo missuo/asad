@@ -1,0 +1,69 @@
+# Builds asad from the private source repo (missuo/asa, read-only deploy key) and publishes a release here
+# whenever asad/VERSION names a version that has not been released yet.
+name: release
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      build_only:
+        description: "Run tests and build, but do not publish"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out asad source (private)
+        uses: actions/checkout@v4
+        with:
+          repository: missuo/asa
+          ssh-key: ${{ secrets.ASA_DEPLOY_KEY }}
+          path: src
+
+      - name: Decide whether to release
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(tr -d '[:space:]' < src/asad/VERSION)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C src rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          if gh release view "v$v" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then exists=true; else exists=false; fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          if [ "$exists" = false ] || [ "${{ inputs.build_only }}" = true ]; then echo "build=true" >> "$GITHUB_OUTPUT"; else echo "build=false" >> "$GITHUB_OUTPUT"; echo "v$v already released"; fi
+
+      - if: steps.v.outputs.build == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/asad/go.mod
+          cache-dependency-path: src/asad/go.sum
+
+      - name: Test (vet + race, with and without with_acme)
+        if: steps.v.outputs.build == 'true'
+        working-directory: src/asad
+        run: make test
+
+      - name: Build linux/amd64 + linux/arm64
+        if: steps.v.outputs.build == 'true'
+        working-directory: src/asad
+        run: make dist VERSION=${{ steps.v.outputs.version }}
+
+      - name: Publish release
+        if: steps.v.outputs.build == 'true' && steps.v.outputs.exists == 'false' && inputs.build_only != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd src/asad/dist
+          gh release create "v${{ steps.v.outputs.version }}" asad-linux-amd64 asad-linux-arm64 SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "asad ${{ steps.v.outputs.version }}" \
+            --notes "Built by GitHub Actions from source revision ${{ steps.v.outputs.sha }}. Verify with SHA256SUMS."
