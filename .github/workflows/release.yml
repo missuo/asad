@@ -1,5 +1,13 @@
-# Builds asad from the private source repo (missuo/asa, read-only deploy key) and publishes a release here
+# Builds asad from the private source repo (missuo/asa, read-only deploy key) and publishes a signed release here
 # whenever asad/VERSION names a version that has not been released yet.
+#
+# Hardening (2026-11-07 security review):
+# - The build job (tests, govulncheck, build) runs with a read-only token and never sees the signing key.
+# - Only the publish job gets contents: write and ASAD_SIGNING_KEY; it signs SHA256SUMS (Ed25519, SHA256SUMS.sig)
+#   with asad's own signer, which refuses keys that don't match the public key embedded in asad.
+# - Actions are pinned to commit SHAs; checkouts don't keep credentials.
+# - Go comes from the toolchain line in asad/go.mod (GOTOOLCHAIN=auto), and govulncheck must report no reachable
+#   vulnerabilities before anything is published.
 name: release
 
 on:
@@ -13,40 +21,68 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
+env:
+  GOTOOLCHAIN: auto
+
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      sha: ${{ steps.v.outputs.sha }}
+      publish: ${{ steps.v.outputs.publish }}
+      build: ${{ steps.v.outputs.build }}
     steps:
       - name: Check out asad source (private)
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: missuo/asa
           ssh-key: ${{ secrets.ASA_DEPLOY_KEY }}
           path: src
+          persist-credentials: false
 
       - name: Decide whether to release
         id: v
         env:
           GH_TOKEN: ${{ github.token }}
+          BUILD_ONLY: ${{ inputs.build_only }}
         run: |
           v=$(tr -d '[:space:]' < src/asad/VERSION)
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git -C src rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           if gh release view "v$v" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then exists=true; else exists=false; fi
-          echo "exists=$exists" >> "$GITHUB_OUTPUT"
-          if [ "$exists" = false ] || [ "${{ inputs.build_only }}" = true ]; then echo "build=true" >> "$GITHUB_OUTPUT"; else echo "build=false" >> "$GITHUB_OUTPUT"; echo "v$v already released"; fi
+          if [ "$exists" = false ] && [ "$BUILD_ONLY" != true ]; then echo "publish=true" >> "$GITHUB_OUTPUT"; else echo "publish=false" >> "$GITHUB_OUTPUT"; fi
+          if [ "$exists" = false ] || [ "$BUILD_ONLY" = true ]; then echo "build=true" >> "$GITHUB_OUTPUT"; else echo "build=false" >> "$GITHUB_OUTPUT"; echo "v$v already released"; fi
 
       - if: steps.v.outputs.build == 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: src/asad/go.mod
           cache-dependency-path: src/asad/go.sum
+
+      - name: Show Go version (must match the toolchain line in go.mod)
+        if: steps.v.outputs.build == 'true'
+        working-directory: src/asad
+        run: |
+          want=$(awk '/^toolchain /{print $2}' go.mod)
+          got=$(go env GOVERSION)
+          echo "go.mod toolchain: ${want:-none}, using: $got"
+          if [ -n "$want" ] && [ "$want" != "$got" ]; then echo "toolchain mismatch" >&2; exit 1; fi
+
+      - name: govulncheck (no reachable vulnerabilities allowed)
+        if: steps.v.outputs.build == 'true'
+        working-directory: src/asad
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -tags with_acme ./...
 
       - name: Test (vet + race, with and without with_acme)
         if: steps.v.outputs.build == 'true'
@@ -58,12 +94,58 @@ jobs:
         working-directory: src/asad
         run: make dist VERSION=${{ steps.v.outputs.version }}
 
+      - if: steps.v.outputs.build == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: |
+            src/asad/dist/asad-linux-amd64
+            src/asad/dist/asad-linux-arm64
+            src/asad/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out asad source at the built revision (for the signer)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: missuo/asa
+          ref: ${{ needs.build.outputs.sha }}
+          ssh-key: ${{ secrets.ASA_DEPLOY_KEY }}
+          path: src
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/asad/go.mod
+          cache-dependency-path: src/asad/go.sum
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+
+      - name: Sign SHA256SUMS
+        working-directory: src/asad
+        env:
+          ASAD_SIGNING_KEY: ${{ secrets.ASAD_SIGNING_KEY }}
+        run: |
+          (cd ../../dist && sha256sum -c SHA256SUMS)
+          go run ./cmd/asad-sign ../../dist/SHA256SUMS
+
       - name: Publish release
-        if: steps.v.outputs.build == 'true' && steps.v.outputs.exists == 'false' && inputs.build_only != true
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA: ${{ needs.build.outputs.sha }}
         run: |
-          cd src/asad/dist
-          gh release create "v${{ steps.v.outputs.version }}" asad-linux-amd64 asad-linux-arm64 SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" --title "asad ${{ steps.v.outputs.version }}" \
-            --notes "Built by GitHub Actions from source revision ${{ steps.v.outputs.sha }}. Verify with SHA256SUMS."
+          cd dist
+          gh release create "v$VERSION" asad-linux-amd64 asad-linux-arm64 SHA256SUMS SHA256SUMS.sig \
+            --repo "$GITHUB_REPOSITORY" --title "asad $VERSION" \
+            --notes "Built by GitHub Actions from source revision ${SHA:0:7}. SHA256SUMS is signed (Ed25519, SHA256SUMS.sig); asad upgrade verifies both."
